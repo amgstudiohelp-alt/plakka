@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
@@ -27,6 +28,10 @@ const _oneSignalAppId = String.fromEnvironment(
   defaultValue: 'eed40171-4e79-4a92-8d45-d2fa745ced03',
 );
 const _webSessionChannel = MethodChannel('com.uygaria.plakka/web_session');
+const _appUpdateChannel = MethodChannel('com.uygaria.plakka/app_update');
+const _appPermissionsChannel = MethodChannel('com.uygaria.plakka/permissions');
+const _iosAppStoreCountry = 'tr';
+const _storeLookupTimeout = Duration(seconds: 6);
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -51,7 +56,7 @@ Future<void> _initializeOneSignal() async {
 }
 
 Future<bool?> _getNotificationConsent() async {
-  if (!Platform.isAndroid) {
+  if (!Platform.isAndroid && !Platform.isIOS) {
     return null;
   }
 
@@ -67,7 +72,7 @@ Future<bool?> _getNotificationConsent() async {
 }
 
 Future<void> _setNotificationConsent(bool allowed) async {
-  if (!Platform.isAndroid) {
+  if (!Platform.isAndroid && !Platform.isIOS) {
     return;
   }
 
@@ -135,7 +140,7 @@ class _PlakkaWebViewState extends State<PlakkaWebView>
     WidgetsBinding.instance.addObserver(this);
     unawaited(_loadWhenOnline());
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      unawaited(_askForNotificationPermissionIfNeeded());
+      unawaited(_runStartupPrompts());
     });
   }
 
@@ -236,8 +241,189 @@ class _PlakkaWebViewState extends State<PlakkaWebView>
     return controller;
   }
 
+  Future<void> _runStartupPrompts() async {
+    await _askForNotificationPermissionIfNeeded();
+    await _askForInitialMediaPermissionsIfNeeded();
+    await _checkForAppUpdateIfNeeded();
+  }
+
+  Future<void> _checkForAppUpdateIfNeeded() async {
+    if (!Platform.isAndroid && !Platform.isIOS) {
+      return;
+    }
+
+    try {
+      if (Platform.isAndroid) {
+        await _checkAndroidStoreUpdateIfNeeded();
+        return;
+      }
+
+      await _checkIosStoreUpdateIfNeeded();
+    } on Object {
+      return;
+    }
+  }
+
+  Future<void> _checkAndroidStoreUpdateIfNeeded() async {
+    final update = await _androidStoreUpdate();
+    if (!mounted || !update.isAvailable) {
+      return;
+    }
+
+    final shouldUpdate = await _showStoreUpdateDialog();
+    if (!mounted || shouldUpdate != true) {
+      return;
+    }
+
+    await _startStoreUpdate();
+  }
+
+  Future<void> _checkIosStoreUpdateIfNeeded() async {
+    final installedVersion = await _installedAppVersion();
+    if (installedVersion == null || installedVersion.bundleId.isEmpty) {
+      return;
+    }
+
+    final storeVersion = await _fetchIosStoreVersion(installedVersion.bundleId);
+    if (!mounted ||
+        storeVersion == null ||
+        !_isStoreVersionNewer(
+          storeVersion.version,
+          installedVersion.versionName,
+        )) {
+      return;
+    }
+
+    final shouldUpdate = await _showStoreUpdateDialog(
+      version: storeVersion.version,
+    );
+    if (!mounted || shouldUpdate != true) {
+      return;
+    }
+
+    await _openStorePage(storeVersion.storeUrl);
+  }
+
+  Future<AndroidStoreUpdate> _androidStoreUpdate() async {
+    final updateInfo =
+        await _appUpdateChannel.invokeMapMethod<String, dynamic>(
+          'checkStoreUpdate',
+        ) ??
+        const <String, dynamic>{};
+
+    return AndroidStoreUpdate.fromMap(updateInfo);
+  }
+
+  Future<InstalledAppVersion?> _installedAppVersion() async {
+    final versionInfo = await _appUpdateChannel
+        .invokeMapMethod<String, dynamic>('getInstalledVersion');
+    if (versionInfo == null) {
+      return null;
+    }
+
+    return InstalledAppVersion.fromMap(versionInfo);
+  }
+
+  Future<IosStoreVersion?> _fetchIosStoreVersion(String bundleId) async {
+    final client = HttpClient();
+    try {
+      final lookupUri = Uri.https('itunes.apple.com', '/lookup', {
+        'bundleId': bundleId,
+        'country': _iosAppStoreCountry,
+      });
+      final request = await client
+          .getUrl(lookupUri)
+          .timeout(_storeLookupTimeout);
+      final response = await request.close().timeout(_storeLookupTimeout);
+      if (response.statusCode != HttpStatus.ok) {
+        return null;
+      }
+
+      final body = await response
+          .transform(utf8.decoder)
+          .join()
+          .timeout(_storeLookupTimeout);
+      final payload = jsonDecode(body);
+      if (payload is! Map<String, dynamic>) {
+        return null;
+      }
+
+      final results = payload['results'];
+      if (results is! List || results.isEmpty) {
+        return null;
+      }
+
+      for (final item in results) {
+        if (item is! Map<String, dynamic>) {
+          continue;
+        }
+
+        final version = item['version'] as String?;
+        final storeUrl = item['trackViewUrl'] as String?;
+        if (version != null &&
+            version.trim().isNotEmpty &&
+            storeUrl != null &&
+            storeUrl.trim().isNotEmpty) {
+          return IosStoreVersion(version.trim(), storeUrl.trim());
+        }
+      }
+
+      return null;
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<bool?> _showStoreUpdateDialog({String? version}) {
+    final content = version == null
+        ? 'Plakka için yeni bir güncelleme yayınlandı. En iyi deneyim için '
+              'uygulamayı güncelleyin.'
+        : 'Plakka $version sürümü yayınlandı. En iyi deneyim için uygulamayı '
+              'güncelleyin.';
+
+    return showDialog<bool>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Güncelleme mevcut'),
+          content: Text(content),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Daha sonra'),
+            ),
+            FilledButton.icon(
+              onPressed: () => Navigator.of(context).pop(true),
+              icon: const Icon(Icons.system_update_alt_rounded),
+              label: const Text('Güncelle'),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  Future<void> _startStoreUpdate() async {
+    try {
+      await _appUpdateChannel.invokeMethod<bool>('startStoreUpdate');
+    } on PlatformException {
+      return;
+    }
+  }
+
+  Future<void> _openStorePage(String storeUrl) async {
+    try {
+      await _appUpdateChannel.invokeMethod<bool>('openStorePage', {
+        'url': storeUrl,
+      });
+    } on PlatformException {
+      return;
+    }
+  }
+
   Future<void> _askForNotificationPermissionIfNeeded() async {
-    if (!Platform.isAndroid || _oneSignalAppId.trim().isEmpty) {
+    if ((!Platform.isAndroid && !Platform.isIOS) ||
+        _oneSignalAppId.trim().isEmpty) {
       return;
     }
 
@@ -292,6 +478,22 @@ class _PlakkaWebViewState extends State<PlakkaWebView>
       await OneSignal.User.pushSubscription.optIn();
     } else {
       await OneSignal.User.pushSubscription.optOut();
+    }
+  }
+
+  Future<void> _askForInitialMediaPermissionsIfNeeded() async {
+    if (!Platform.isIOS) {
+      return;
+    }
+
+    try {
+      await _appPermissionsChannel.invokeMethod<Object?>(
+        'requestInitialMediaPermissions',
+      );
+    } on MissingPluginException {
+      return;
+    } on PlatformException {
+      return;
     }
   }
 
@@ -433,8 +635,22 @@ class _PlakkaWebViewState extends State<PlakkaWebView>
           unawaited(_handleBack());
         }
       },
-      child: Scaffold(
-        body: SafeArea(top: false, bottom: false, child: _buildBody()),
+      child: Scaffold(body: _buildTopSafeBody(context)),
+    );
+  }
+
+  Widget _buildTopSafeBody(BuildContext context) {
+    final mediaQuery = MediaQuery.of(context);
+
+    return Padding(
+      key: const ValueKey('topSafeBodyPadding'),
+      padding: EdgeInsets.only(top: mediaQuery.viewPadding.top),
+      child: MediaQuery(
+        data: mediaQuery.copyWith(
+          padding: EdgeInsets.zero,
+          viewPadding: EdgeInsets.zero,
+        ),
+        child: _buildBody(),
       ),
     );
   }
@@ -470,6 +686,74 @@ class PickerOptions {
 
   final FileType type;
   final List<String>? allowedExtensions;
+}
+
+class AndroidStoreUpdate {
+  const AndroidStoreUpdate({required this.isAvailable});
+
+  factory AndroidStoreUpdate.fromMap(Map<String, dynamic> map) {
+    return AndroidStoreUpdate(isAvailable: map['available'] == true);
+  }
+
+  final bool isAvailable;
+}
+
+class InstalledAppVersion {
+  const InstalledAppVersion({
+    required this.bundleId,
+    required this.versionName,
+  });
+
+  factory InstalledAppVersion.fromMap(Map<String, dynamic> map) {
+    return InstalledAppVersion(
+      bundleId: map['bundleId'] as String? ?? '',
+      versionName: map['versionName'] as String? ?? '',
+    );
+  }
+
+  final String bundleId;
+  final String versionName;
+}
+
+class IosStoreVersion {
+  const IosStoreVersion(this.version, this.storeUrl);
+
+  final String version;
+  final String storeUrl;
+}
+
+bool _isStoreVersionNewer(String storeVersion, String currentVersion) {
+  if (storeVersion.trim().isEmpty || currentVersion.trim().isEmpty) {
+    return false;
+  }
+
+  return _compareVersionNumbers(storeVersion, currentVersion) > 0;
+}
+
+int _compareVersionNumbers(String left, String right) {
+  final leftParts = _versionParts(left);
+  final rightParts = _versionParts(right);
+  final maxLength = leftParts.length > rightParts.length
+      ? leftParts.length
+      : rightParts.length;
+
+  for (var index = 0; index < maxLength; index += 1) {
+    final leftPart = index < leftParts.length ? leftParts[index] : 0;
+    final rightPart = index < rightParts.length ? rightParts[index] : 0;
+    if (leftPart != rightPart) {
+      return leftPart.compareTo(rightPart);
+    }
+  }
+
+  return 0;
+}
+
+List<int> _versionParts(String version) {
+  return version
+      .split(RegExp(r'[^0-9]+'))
+      .where((part) => part.isNotEmpty)
+      .map((part) => int.tryParse(part) ?? 0)
+      .toList();
 }
 
 class OfflineView extends StatelessWidget {

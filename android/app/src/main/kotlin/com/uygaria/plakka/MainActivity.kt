@@ -1,16 +1,38 @@
 package com.uygaria.plakka
 
+import android.content.ActivityNotFoundException
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
 import android.webkit.CookieManager
+import com.google.android.play.core.appupdate.AppUpdateInfo
+import com.google.android.play.core.appupdate.AppUpdateManager
+import com.google.android.play.core.appupdate.AppUpdateManagerFactory
+import com.google.android.play.core.install.model.AppUpdateType
+import com.google.android.play.core.install.model.UpdateAvailability
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : FlutterActivity() {
     private val channelName = "com.uygaria.plakka/web_session"
+    private val appUpdateChannelName = "com.uygaria.plakka/app_update"
     private val preferencesName = "plakka_web_session"
     private val cookiesKey = "cookies"
     private val lastUrlKey = "last_url"
     private val notificationConsentKey = "notification_consent"
+    private val appUpdateRequestCode = 5201
+    private lateinit var appUpdateManager: AppUpdateManager
+
+    override fun onResume() {
+        super.onResume()
+
+        ensureAppUpdateManager().appUpdateInfo.addOnSuccessListener { updateInfo ->
+            if (updateInfo.updateAvailability() == UpdateAvailability.DEVELOPER_TRIGGERED_UPDATE_IN_PROGRESS) {
+                startImmediateUpdate(updateInfo, null)
+            }
+        }
+    }
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -33,6 +55,25 @@ class MainActivity : FlutterActivity() {
                         val allowed = call.arguments as? Boolean ?: false
                         saveNotificationConsent(allowed)
                         result.success(null)
+                    }
+                    else -> result.notImplemented()
+                }
+            }
+
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, appUpdateChannelName)
+            .setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "getInstalledVersion" -> {
+                        result.success(installedVersionInfo())
+                    }
+                    "checkStoreUpdate" -> {
+                        checkStoreUpdate(result)
+                    }
+                    "startStoreUpdate" -> {
+                        startStoreUpdate(result)
+                    }
+                    "openStorePage" -> {
+                        openPlayStore(result)
                     }
                     else -> result.notImplemented()
                 }
@@ -115,5 +156,102 @@ class MainActivity : FlutterActivity() {
             .edit()
             .putBoolean(notificationConsentKey, allowed)
             .apply()
+    }
+
+    private fun installedVersionInfo(): Map<String, String> {
+        val packageInfo = packageManager.getPackageInfo(packageName, 0)
+        val versionCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            packageInfo.longVersionCode
+        } else {
+            @Suppress("DEPRECATION")
+            packageInfo.versionCode.toLong()
+        }
+
+        return mapOf(
+            "bundleId" to packageName,
+            "versionName" to (packageInfo.versionName ?: ""),
+            "buildNumber" to versionCode.toString()
+        )
+    }
+
+    private fun checkStoreUpdate(result: MethodChannel.Result) {
+        ensureAppUpdateManager().appUpdateInfo
+            .addOnSuccessListener { updateInfo ->
+                val updateAvailable =
+                    updateInfo.updateAvailability() == UpdateAvailability.UPDATE_AVAILABLE
+                val immediateAllowed = updateInfo.isUpdateTypeAllowed(AppUpdateType.IMMEDIATE)
+                val flexibleAllowed = updateInfo.isUpdateTypeAllowed(AppUpdateType.FLEXIBLE)
+
+                result.success(
+                    mapOf(
+                        "available" to (updateAvailable && (immediateAllowed || flexibleAllowed)),
+                        "availableVersionCode" to updateInfo.availableVersionCode(),
+                        "immediateAllowed" to immediateAllowed,
+                        "flexibleAllowed" to flexibleAllowed,
+                        "priority" to updateInfo.updatePriority(),
+                        "stalenessDays" to updateInfo.clientVersionStalenessDays()
+                    )
+                )
+            }
+            .addOnFailureListener {
+                result.success(mapOf("available" to false))
+            }
+    }
+
+    private fun startStoreUpdate(result: MethodChannel.Result) {
+        ensureAppUpdateManager().appUpdateInfo
+            .addOnSuccessListener { updateInfo ->
+                val updateAvailable =
+                    updateInfo.updateAvailability() == UpdateAvailability.UPDATE_AVAILABLE
+
+                if (updateAvailable && updateInfo.isUpdateTypeAllowed(AppUpdateType.IMMEDIATE)) {
+                    startImmediateUpdate(updateInfo, result)
+                } else {
+                    openPlayStore(result)
+                }
+            }
+            .addOnFailureListener {
+                openPlayStore(result)
+            }
+    }
+
+    private fun startImmediateUpdate(
+        updateInfo: AppUpdateInfo,
+        result: MethodChannel.Result?
+    ) {
+        try {
+            ensureAppUpdateManager().startUpdateFlowForResult(
+                updateInfo,
+                AppUpdateType.IMMEDIATE,
+                this,
+                appUpdateRequestCode
+            )
+            result?.success(true)
+        } catch (_: Exception) {
+            if (result != null) {
+                openPlayStore(result)
+            }
+        }
+    }
+
+    private fun ensureAppUpdateManager(): AppUpdateManager {
+        if (!::appUpdateManager.isInitialized) {
+            appUpdateManager = AppUpdateManagerFactory.create(this)
+        }
+
+        return appUpdateManager
+    }
+
+    private fun openPlayStore(result: MethodChannel.Result) {
+        val marketUri = Uri.parse("market://details?id=$packageName")
+        val webUri = Uri.parse("https://play.google.com/store/apps/details?id=$packageName")
+
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, marketUri))
+            result.success(true)
+        } catch (_: ActivityNotFoundException) {
+            startActivity(Intent(Intent.ACTION_VIEW, webUri))
+            result.success(true)
+        }
     }
 }

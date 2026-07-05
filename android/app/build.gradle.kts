@@ -68,6 +68,10 @@ flutter {
     source = "../.."
 }
 
+dependencies {
+    implementation("com.google.android.play:app-update:2.1.0")
+}
+
 tasks.matching { it.name == "bundleRelease" || it.name == "assembleRelease" }.configureEach {
     doFirst {
         if (!hasReleaseKeystore) {
