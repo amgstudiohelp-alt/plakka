@@ -32,6 +32,10 @@ const _appUpdateChannel = MethodChannel('com.uygaria.plakka/app_update');
 const _appPermissionsChannel = MethodChannel('com.uygaria.plakka/permissions');
 const _iosAppStoreCountry = 'tr';
 const _storeLookupTimeout = Duration(seconds: 6);
+const _connectivityTimeout = Duration(seconds: 2);
+const _connectivityRetryDelay = Duration(milliseconds: 700);
+const _connectivityAttempts = 3;
+const _transientReloadCooldown = Duration(seconds: 8);
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -89,14 +93,24 @@ Future<void> _setNotificationConsent(bool allowed) async {
 }
 
 Future<bool> _hasInternet() async {
-  try {
-    final addresses = await InternetAddress.lookup(
-      _primarySiteHost,
-    ).timeout(const Duration(seconds: 5));
-    return addresses.isNotEmpty && addresses.first.rawAddress.isNotEmpty;
-  } on Object {
-    return false;
+  for (var attempt = 0; attempt < _connectivityAttempts; attempt += 1) {
+    if (attempt > 0) {
+      await Future<void>.delayed(_connectivityRetryDelay);
+    }
+
+    try {
+      final addresses = await InternetAddress.lookup(
+        _primarySiteHost,
+      ).timeout(_connectivityTimeout);
+      if (addresses.isNotEmpty && addresses.first.rawAddress.isNotEmpty) {
+        return true;
+      }
+    } on Object {
+      continue;
+    }
   }
+
+  return false;
 }
 
 class PlakkaApp extends StatelessWidget {
@@ -133,6 +147,9 @@ class _PlakkaWebViewState extends State<PlakkaWebView>
   var _isCheckingConnection = true;
   var _isOffline = false;
   var _loadingProgress = 0;
+  Uri? _lastLoadedUri;
+  var _offlineCheckGeneration = 0;
+  DateTime? _lastTransientReloadAt;
 
   @override
   void initState() {
@@ -190,7 +207,12 @@ class _PlakkaWebViewState extends State<PlakkaWebView>
     });
 
     final hasSavedSession = await _restoreWebSession();
-    await controller.loadRequest(hasSavedSession ? _loggedInUri : _loginUri);
+    await _loadUri(controller, hasSavedSession ? _loggedInUri : _loginUri);
+  }
+
+  Future<void> _loadUri(WebViewController controller, Uri uri) async {
+    _lastLoadedUri = uri;
+    await controller.loadRequest(uri);
   }
 
   Future<WebViewController> _createWebViewController() async {
@@ -209,11 +231,20 @@ class _PlakkaWebViewState extends State<PlakkaWebView>
           if (!mounted) {
             return;
           }
-          setState(() => _loadingProgress = 0);
+          _offlineCheckGeneration += 1;
+          setState(() {
+            _isOffline = false;
+            _loadingProgress = 0;
+          });
         },
         onPageFinished: (url) {
           if (!mounted) {
             return;
+          }
+          _offlineCheckGeneration += 1;
+          final uri = Uri.tryParse(url);
+          if (uri != null && _isPlakkaUri(uri)) {
+            _lastLoadedUri = uri;
           }
           setState(() => _loadingProgress = 100);
           unawaited(_saveWebSessionFromUrl(url));
@@ -222,11 +253,9 @@ class _PlakkaWebViewState extends State<PlakkaWebView>
           if (error.isForMainFrame == false || !mounted) {
             return;
           }
-          setState(() {
-            _controller = null;
-            _isOffline = true;
-            _loadingProgress = 0;
-          });
+          if (_isConnectivityError(error)) {
+            unawaited(_handleMainFrameConnectivityError());
+          }
         },
       ),
     );
@@ -239,6 +268,116 @@ class _PlakkaWebViewState extends State<PlakkaWebView>
     }
 
     return controller;
+  }
+
+  bool _isConnectivityError(WebResourceError error) {
+    const connectivityErrorTypes = {
+      WebResourceErrorType.connect,
+      WebResourceErrorType.hostLookup,
+      WebResourceErrorType.io,
+      WebResourceErrorType.timeout,
+      WebResourceErrorType.unknown,
+    };
+
+    final errorType = error.errorType;
+    return errorType == null || connectivityErrorTypes.contains(errorType);
+  }
+
+  Future<void> _handleMainFrameConnectivityError() async {
+    final generation = ++_offlineCheckGeneration;
+    final controller = _controller;
+    final isOnline = await widget.connectivityCheck();
+    if (!mounted || generation != _offlineCheckGeneration) {
+      return;
+    }
+
+    if (isOnline) {
+      await _recoverFromTransientWebError(controller, generation);
+      return;
+    }
+
+    setState(() {
+      _isOffline = true;
+      _loadingProgress = 0;
+    });
+  }
+
+  Future<void> _recoverFromTransientWebError(
+    WebViewController? controller,
+    int generation,
+  ) async {
+    final now = DateTime.now();
+    final lastReloadAt = _lastTransientReloadAt;
+    if (lastReloadAt != null &&
+        now.difference(lastReloadAt) < _transientReloadCooldown) {
+      return;
+    }
+
+    _lastTransientReloadAt = now;
+    await Future<void>.delayed(_connectivityRetryDelay);
+    if (!mounted ||
+        generation != _offlineCheckGeneration ||
+        _controller != controller ||
+        controller == null) {
+      return;
+    }
+
+    await _reloadOrLoadLastKnown(controller);
+  }
+
+  Future<void> _retryCurrentPage() async {
+    final controller = _controller;
+    if (controller == null) {
+      await _loadWhenOnline();
+      return;
+    }
+
+    setState(() {
+      _isCheckingConnection = true;
+      _isOffline = false;
+      _loadingProgress = 0;
+    });
+    _offlineCheckGeneration += 1;
+
+    final isOnline = await widget.connectivityCheck();
+    if (!mounted) {
+      return;
+    }
+
+    if (!isOnline) {
+      setState(() {
+        _isCheckingConnection = false;
+        _isOffline = true;
+      });
+      return;
+    }
+
+    setState(() => _isCheckingConnection = false);
+
+    await _reloadOrLoadLastKnown(controller);
+  }
+
+  Future<void> _reloadOrLoadLastKnown(WebViewController controller) async {
+    try {
+      await controller.reload();
+    } on PlatformException {
+      final currentUri = await _currentPlakkaUri(controller);
+      await _loadUri(controller, currentUri ?? _lastLoadedUri ?? _loginUri);
+    }
+  }
+
+  Future<Uri?> _currentPlakkaUri(WebViewController controller) async {
+    try {
+      final currentUrl = await controller.currentUrl();
+      final uri = Uri.tryParse(currentUrl ?? '');
+      if (uri == null || !_isPlakkaUri(uri)) {
+        return null;
+      }
+
+      return uri;
+    } on PlatformException {
+      return null;
+    }
   }
 
   Future<void> _runStartupPrompts() async {
@@ -661,7 +800,7 @@ class _PlakkaWebViewState extends State<PlakkaWebView>
     }
 
     if (_isOffline || _controller == null) {
-      return OfflineView(onRetry: _loadWhenOnline);
+      return OfflineView(onRetry: _retryCurrentPage);
     }
 
     return Stack(
