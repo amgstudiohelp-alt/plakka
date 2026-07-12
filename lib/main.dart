@@ -36,6 +36,7 @@ const _connectivityTimeout = Duration(seconds: 2);
 const _connectivityRetryDelay = Duration(milliseconds: 700);
 const _connectivityAttempts = 3;
 const _transientReloadCooldown = Duration(seconds: 8);
+const _appHeaderBackgroundColor = Color(0xFFFFFFFF);
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -767,12 +768,11 @@ class _PlakkaWebViewState extends State<PlakkaWebView>
 
   @override
   Widget build(BuildContext context) {
-    final backgroundColor = Theme.of(context).colorScheme.surface;
     final overlayStyle = SystemUiOverlayStyle(
-      statusBarColor: backgroundColor,
+      statusBarColor: _appHeaderBackgroundColor,
       statusBarIconBrightness: Brightness.dark,
       statusBarBrightness: Brightness.light,
-      systemNavigationBarColor: backgroundColor,
+      systemNavigationBarColor: _appHeaderBackgroundColor,
       systemNavigationBarIconBrightness: Brightness.dark,
     );
 
@@ -786,7 +786,7 @@ class _PlakkaWebViewState extends State<PlakkaWebView>
       child: AnnotatedRegion<SystemUiOverlayStyle>(
         value: overlayStyle,
         child: Scaffold(
-          backgroundColor: backgroundColor,
+          backgroundColor: _appHeaderBackgroundColor,
           body: _buildTopSafeBody(context),
         ),
       ),
