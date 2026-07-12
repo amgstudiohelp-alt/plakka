@@ -39,7 +39,7 @@ const _transientReloadCooldown = Duration(seconds: 8);
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+  await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
   await _initializeOneSignal();
   runApp(const PlakkaApp());
 }
@@ -767,6 +767,15 @@ class _PlakkaWebViewState extends State<PlakkaWebView>
 
   @override
   Widget build(BuildContext context) {
+    final backgroundColor = Theme.of(context).colorScheme.surface;
+    final overlayStyle = SystemUiOverlayStyle(
+      statusBarColor: backgroundColor,
+      statusBarIconBrightness: Brightness.dark,
+      statusBarBrightness: Brightness.light,
+      systemNavigationBarColor: backgroundColor,
+      systemNavigationBarIconBrightness: Brightness.dark,
+    );
+
     return PopScope(
       canPop: false,
       onPopInvokedWithResult: (didPop, _) {
@@ -774,7 +783,13 @@ class _PlakkaWebViewState extends State<PlakkaWebView>
           unawaited(_handleBack());
         }
       },
-      child: Scaffold(body: _buildTopSafeBody(context)),
+      child: AnnotatedRegion<SystemUiOverlayStyle>(
+        value: overlayStyle,
+        child: Scaffold(
+          backgroundColor: backgroundColor,
+          body: _buildTopSafeBody(context),
+        ),
+      ),
     );
   }
 
