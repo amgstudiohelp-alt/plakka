@@ -6,21 +6,22 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:onesignal_flutter/onesignal_flutter.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import 'package:webview_flutter_android/webview_flutter_android.dart';
 
 final _loginUri = Uri(
   scheme: 'https',
-  host: 'uygaria.com',
-  path: '/plakka.php',
+  host: 'plakka.uygaria.com',
+  path: '/app.php',
 );
 final _loggedInUri = Uri(
   scheme: 'https',
-  host: 'plakka.tr',
+  host: 'plakka.uygaria.com',
   path: '/index.php',
   queryParameters: {'m': 'logok'},
 );
-const _primarySiteHost = 'plakka.tr';
+const _primarySiteHost = 'plakka.uygaria.com';
 const _legacySiteHost = 'uygaria.com';
 const _supportedSiteHosts = {_primarySiteHost, _legacySiteHost};
 const _oneSignalAppId = String.fromEnvironment(
@@ -622,18 +623,25 @@ class _PlakkaWebViewState extends State<PlakkaWebView>
   }
 
   Future<void> _askForInitialMediaPermissionsIfNeeded() async {
-    if (!Platform.isIOS) {
-      return;
-    }
-
-    try {
-      await _appPermissionsChannel.invokeMethod<Object?>(
-        'requestInitialMediaPermissions',
-      );
-    } on MissingPluginException {
-      return;
-    } on PlatformException {
-      return;
+    if (Platform.isIOS) {
+      try {
+        await _appPermissionsChannel.invokeMethod<Object?>(
+          'requestInitialMediaPermissions',
+        );
+      } on MissingPluginException {
+        return;
+      } on PlatformException {
+        return;
+      }
+    } else if (Platform.isAndroid) {
+      try {
+        await [
+          Permission.photos,
+          Permission.videos,
+        ].request();
+      } catch (_) {
+        // İzin isteğinde hata olursa sessizce devam et
+      }
     }
   }
 
